@@ -1,0 +1,19 @@
+train:
+        train_dir: "/home/mahesh/ayan/Time-Series-Library-main/scripts/imputation_analysis/Deep-Fakes/data/real-vs-fake/train"
+        test_dir:  "/home/mahesh/ayan/Time-Series-Library-main/scripts/imputation_analysis/Deep-Fakes/data/real-vs-fake/valid"
+        # batch_size: 64
+        batch_size : 512
+        optimizer_type : 1
+        learning_rate: 0.0001
+        epochs: 300
+        unfreeze_epoch: 25
+        patience: 20
+        checkpoint_path: "checkpoints_2/alexnet/best_model_optimizer_1.pth"
+
+eval:
+        test_dir: "/home/mahesh/ayan/Time-Series-Library-main/scripts/imputation_analysis/Deep-Fakes/data/real-vs-fake/test"
+        # batch_size: 64
+        batch_size : 512
+        checkpoint_path: "checkpoints_2/alexnet/best_model_optimizer_1.pth"
+
+                                      

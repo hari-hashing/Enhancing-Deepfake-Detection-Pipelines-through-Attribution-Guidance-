@@ -1,0 +1,258 @@
+import torch, torchvision
+import sys
+import numpy as np
+import json 
+import os
+import matplotlib.pyplot as plt
+import tqdm
+import argparse
+import time 
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from tqdm import tqdm
+from captum.attr import IntegratedGradients
+from models.fake_image_model import build_model
+from datasets.fake_image_dataset import FakeImageDataset
+from utils.augmentations import get_train_transforms, get_val_transforms
+from torch.utils.data import DataLoader
+from interpretability_tests.config import config
+
+# cheking the device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}, CPU count : {torch.get_num_threads()}")
+
+# for reproducibitlity of the results setting the seed 
+def set_seed(seed=42):
+    import random 
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+# setting the seed    
+set_seed(42)
+
+# setting the model output cloning 
+def model_forward_clone(model,x):
+    out = model(x)
+    return out.clone()
+
+# deiabling inplace operations used while model development
+def disable_inplace(model):
+    for m in model.modules():
+        if isinstance(m,torch.nn.ReLU):
+            m.inplace = False
+    return model 
+
+# plotting some example from the validation set
+def show_attributions_binary_captum(test_images,test_targets,model):
+    model.eval()
+    model = disable_inplace(model)
+    # as with inplace operations the IG will break 
+    with torch.no_grad():
+        output = model(test_images.to(device))
+    # pred = (output > 0).long()
+    pred = output.argmax(dim = 1)
+    pred_np = pred.detach().cpu().numpy()
+
+    # Use Captum's Integrated Gradients
+    ig = IntegratedGradients(model)
+
+    for i in range(len(test_images[:5])):
+        ti = test_images[[i]].to(device)
+        ti.requires_grad = True
+        
+        # Compute attributions
+        # targeting the predictied class to be interpreted
+        target=int(pred_np[i])
+        attributions = ig.attribute(ti, target=target, n_steps=50)
+        
+        # Get image and attribution values
+        img = ti.detach().cpu().numpy()[0]  # CHW
+        attr = attributions.detach().cpu().numpy()[0]  # CHW
+        
+        # Convert to HWC for plotting
+        img = np.transpose(img, (1, 2, 0))
+        attr = np.transpose(attr, (1, 2, 0))
+        
+        # Normalize image to [0, 1]
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Plot original image
+        if img.shape[2] == 1:
+            axes[0].imshow(img[:, :, 0], cmap='gray')
+        else:
+            axes[0].imshow(img)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        # Plot attribution importance
+        attr_abs = np.abs(attr).sum(axis=2)
+        im = axes[1].imshow(attr_abs, cmap='gray')
+        axes[1].set_title('Attribution Importance')
+        axes[1].axis('off')
+        plt.colorbar(im, ax=axes[1])
+        
+        fig.suptitle(f'Actual: {test_targets[i]}, Pred: {pred_np[i]}', 
+                     fontsize=14, fontweight='bold')
+        
+        with open(f'./interpretablility_results/alexnet/IntegratedGradients_Image_{i}.png','wb') as f:
+            plt.savefig(f)
+            
+        plt.tight_layout()
+        plt.show()
+        
+def plot_and_save(attr,save_folder_path,attr_type : bool): 
+        attr_abs = np.abs(attr).sum(axis=2)
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        # Display the data as an image using imshow
+        # 'cmap' parameter specifies the colormap (e.g., 'viridis', 'plasma', 'jet', 'coolwarm')
+        # 'interpolation="nearest"' can be used to avoid blurry images for small arrays
+        img_plot = ax.imshow(attr_abs, cmap='gray')
+
+        # Add a color bar
+        cbar = plt.colorbar(img_plot, ax=ax)
+        cbar.set_label('Absolute Sum Value') 
+
+        # Add a title
+        ax.set_title('Avg attribution importance')
+
+        # Save the figure to a file (must be called BEFORE plt.show())
+        # You can save in various formats like PNG, PDF, SVG by changing the filename extension
+        # checking for the available folder path existing or not 
+        os.makedirs(save_folder_path,exist_ok=True)
+        
+        if attr_type == True:
+            save_path = os.path.join(save_folder_path,"true_imgs_avg_ig_map.png")
+        else:
+            save_path = os.path.join(save_folder_path,"fake_imgs_avg_ig_map.png")
+
+        with open(save_path,'wb') as f:
+            plt.savefig(save_path, bbox_inches='tight')
+
+        # Display the plot
+        plt.show()
+        
+# averaging the attribution map generated by the IG method for the overall validation set 
+def main():
+    time_taken = 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["sample","avg"], help="sample generates some smaples of attr maps and avg generates a total average attr maps for the whole dataset ")
+    args = parser.parse_args()
+    # init the config 
+    cfg = config()
+    # setting the dataloader 
+    ds = FakeImageDataset(cfg.test_dir, transform=get_val_transforms())
+    loader = DataLoader(ds, 
+                        batch_size = cfg.batch_size, 
+                        shuffle=cfg.shuffle,
+                        num_workers=cfg.num_workers,
+                        pin_memory=cfg.pin_memory,
+                        persistent_workers=cfg.persistent_workers,
+                        prefetch_factor =cfg.prefetch_factor
+                        )
+    # setting up the pbar
+    total_imgs = len(loader.dataset)
+    pbar = tqdm(total = total_imgs,desc = "IG Maps",bar_format = (
+    "{l_bar}"
+    "\033[96m{bar}\033[0m"
+    "{r_bar}"
+    ),leave = True)
+    # setting the  model 
+    model = build_model(unfreeze_at_epoch=None).to(device)
+    model.load_state_dict(torch.load(cfg.model_chkpt, map_location=cfg.device))
+    model.eval()
+    
+    # getting the average attribution maps got from the IG method 
+    # differentiating between real and fake only 
+    start_time = time.time()
+    def get_average_attributions_by_ig_method():
+        
+        img,_  = next(iter(loader))
+        c,h,w=img[0].cpu().numpy().shape
+        # initializing an empty attr map
+        true_ig_attr_map = np.zeros((h,w,c),np.float32)
+        fake_img_ig_attr_map = np.zeros((h,w,c),dtype=np.float32)
+    
+        true_img_cnt,fake_img_cnt,global_img_cnt = 0,0,0
+        for batch_idx,(test_images,test_targets) in enumerate(loader):
+            
+            # with torch.no_grad() is not used as the IG method requires the gradients 
+            with torch.no_grad():
+                output = model(test_images.to(device))
+            # pred = (output > 0).long()
+            pred = output.argmax(dim = 1)
+            pred_np = pred.detach().cpu().numpy()
+
+            # Use Captum's Integrated Gradients
+            ig = IntegratedGradients(model)
+            for i in range(len(test_images)):
+                
+                # print(f"/======= Interpreting img number {i+1} from batch number {batch_num+1} ======= /")
+                ti = test_images[[i]].to(device)
+                ti.requires_grad = True
+        
+                # Compute attributions
+                # captum wants int rather target=pred_np[i] converts to np.int64
+                target=int(pred_np[i])
+                # print("target type is :",type(target))
+                attributions = ig.attribute(ti, target=target, n_steps=50)
+        
+                # Get image and attribution values
+                img = ti.detach().cpu().numpy()[0]  # CHW
+                attr = attributions.detach().cpu().numpy()[0]  # CHW
+        
+                attr = np.transpose(attr, (1, 2, 0))
+
+                # Normalize image to [0, 1]
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                
+                # mapping based on based on pred 
+                if test_targets.cpu().numpy()[i] == 1:
+                    true_img_cnt += 1
+                    true_ig_attr_map += attr
+                else : 
+                    fake_img_cnt += 1
+                    fake_img_ig_attr_map += attr
+                
+                label_str = "\033[92mREAL\033[0m" if test_targets.cpu().numpy()[i] == 1 else "\033[91mFAKE\033[0m"
+                pbar.set_description(
+                f"\033[96m IG \033[0m |"
+                f"\033[95m Batch {batch_idx + 1}/{len(loader)}\033[0m | "
+                f"\033[94m Image {global_img_cnt + 1}/{len(test_images)}\033[0m |"
+                f"{label_str}"
+                )
+                global_img_cnt += 1
+                pbar.set_postfix({
+                "target": target,
+                "device": device.type
+                })
+                pbar.update(1)
+            
+        # normalizing the map values
+        # avoiding zero division
+        true_ig_attr_map /= max(true_img_cnt,1)
+        fake_img_ig_attr_map /= max(fake_img_cnt,1)
+        plot_and_save(true_ig_attr_map,cfg.fig_save_folderpath,True)
+        plot_and_save(fake_img_ig_attr_map,cfg.fig_save_folderpath,False)
+    
+    time_taken = time.time()-start_time
+    if args.mode == 'sample':
+        img,labels = next(iter(loader))
+        show_attributions_binary_captum(img,labels,model)
+    else :
+        get_average_attributions_by_ig_method()
+    pbar.close()
+    print(f"total batches processed {len(loader.dataset)}")
+    print(f"IG interpretation done for {total_imgs}")
+    print(f"total time taken for the genrating avg IG Map : {time_taken}")
+    print(f"The final avg attr maps generated by IG method saved at folder path : {cfg.fig_save_folderpath}")
+        
+if __name__ == "__main__":
+    main()
